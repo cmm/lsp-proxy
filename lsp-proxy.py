@@ -19,7 +19,7 @@ preserved_requests = [
     'textDocument/formatting', 'textDocument/rangeFormatting',
     'textDocument/completion', 'completionItem/resolve',
     'textDocument/signatureHelp',
-    'textDocument/codeAction',
+    'textDocument/codeAction', 'codeAction/resolve',
     'workspace/executeCommand'
 ]
 preserved_notifications = [
@@ -86,6 +86,7 @@ class Server(ABC):
         self.use_completion = False
         self.use_signature = False
         self.use_execute_command = False
+        self.use_code_action_resolve = False
         self.received_code_actions = {}
         self.supported_code_action_kinds = []
         self.supported_commands = []
@@ -123,6 +124,15 @@ class Server(ABC):
         capabilities = self._get_capabilities()
         if capabilities:
             return safe_get(capabilities, 'codeActionProvider')
+        return None
+
+    def get_code_action_resolve_capability(self):
+        capabilities = self._get_capabilities()
+        if capabilities:
+            provider = safe_get(capabilities, 'codeActionProvider')
+            if provider and (not isinstance(provider, dict) or
+                             ('codeActionKinds' in provider and provider.get('resolveProvider', False))):
+                return provider
         return None
 
     def get_execute_command_capability(self, command):
@@ -303,6 +313,10 @@ class Proxy:
         return self.get_server_generic(lambda srv: srv.use_execute_command,
             lambda srv: srv.get_execute_command_capability(command))
 
+    def get_code_action_resolve_server(self):
+        return self.get_server_generic(lambda srv: srv.use_code_action_resolve,
+                                       lambda srv: srv.get_code_action_resolve_capability())
+
     def get_initialization_options(self):
         msg = copy.deepcopy(self.get_primary().initialize_msg)
         result = msg['result']
@@ -331,15 +345,18 @@ class Proxy:
         code_action_kinds = []
         commands = []
         supports_code_action = False
+        supports_code_action_resolve = False
         for srv in self.servers:
             srv_capabilities = srv.initialize_msg['result']['capabilities']
-            provider = safe_get(srv_capabilities, 'codeActionProvider')
+            provider = srv.get_code_action_capability()
+            resolve_provider = srv.get_code_action_resolve_capability()
             if provider:
                 supports_code_action = True
-                # can also be just boolean
-                if isinstance(provider, dict) and 'codeActionKinds' in provider:
-                    srv.supported_code_action_kinds = provider['codeActionKinds']
-                    code_action_kinds += srv.supported_code_action_kinds
+                srv.supported_code_action_kinds = provider['codeActionKinds']
+                code_action_kinds += srv.supported_code_action_kinds
+
+            if resolve_provider:
+                supports_code_action_resolve = True
 
             provider = safe_get(srv_capabilities, 'executeCommandProvider')
             if provider:
@@ -350,6 +367,8 @@ class Proxy:
         if supports_code_action:
             capabilities['codeActionProvider'] = {}
             capabilities['codeActionProvider']['codeActionKinds'] = list(set(code_action_kinds))
+            if supports_code_action_resolve:
+                capabilities['codeActionProvider']['resolveProvider'] = True
 
         if len(commands) > 0:
             capabilities['executeCommandProvider'] = {}
@@ -424,7 +443,7 @@ class Proxy:
                         msg['result'] = []
                         result = msg['result']
                         for s in self.servers:
-                            srv_result = s.received_code_actions[iden]
+                            srv_result = s.received_code_actions.get(iden, None)
                             if srv_result:
                                 result += srv_result
                                 del s.received_code_actions[iden]
@@ -455,7 +474,10 @@ class Proxy:
             elif method == 'textDocument/signatureHelp':
                 if srv != self.get_signature_server():
                     should_send = False
-            elif method in ['textDocument/codeAction', 'codeAction/resolve']:
+            elif method == 'codeAction/resolve':
+                if not srv.get_code_action_resolve_capability():
+                    should_send = False
+            elif method == 'textDocument/codeAction':
                 if not srv.get_code_action_capability():
                     should_send = False
                 if should_send:
@@ -612,6 +634,8 @@ def load_config(cfg):
             srv.use_signature = srv_cfg['useSignatureHelp']
         if 'useExecuteCommand' in srv_cfg:
             srv.use_execute_command = srv_cfg['useExecuteCommand']
+        if 'useCodeActionResolve' in srv_cfg:
+            srv.use_code_action_resolve = srv_cfg['useCodeActionResolve']
 
         servers.append(srv)
         is_primary = False
